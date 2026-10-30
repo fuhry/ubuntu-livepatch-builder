@@ -1,0 +1,128 @@
+#!/bin/bash
+
+set -euo pipefail
+
+die() {
+    [ -t 1 ] && echo -e "\e[32;1mERROR:\e[0;1m $1\e[0m" >&2 || echo "$1" >&2
+    exit 1
+}
+
+info() {
+    [ -t 1 ] && echo -e "\e[32;1mINFO:\e[0;1m  $1\e[0m" >&2 || echo "$1" >&2
+}
+
+usage() {
+    die "Usage: $0 kernel_version kernel_flavor"
+}
+
+PID_FILE="/run/$(basename "$0").pid"
+if test -r "$PID_FILE"; then
+    RUNNING_PID="$(cat "$PID_FILE")"
+    if kill -0 "$RUNNING_PID" 2>/dev/null; then
+        die "Script is already running (PID $RUNNING_PID). Concurrent builds will fail and are unsupported! Start another container instead."
+    fi
+fi
+echo "$$" > "$PID_FILE"
+trap "rm -f $PID_FILE" EXIT
+
+. /root/kpatch-shellrc
+
+KERNEL_REV="${1:-}"
+KERNEL_FLAVOR="${2:-generic}"
+
+[[ "$KERNEL_REV" =~ ^[0-9]+$ ]] || die "Kernel revision MUST be an integer"
+[[ "$KERNEL_FLAVOR" =~ ^[a-z]+(-[a-z]+)*$ ]] || die "Kernel flavor MUST be one or more lowercase words (a-z) separated by dashes"
+[[ "$KVER" =~ ^[0-9]+(\.[0-9]+){2}$ ]] || die "Kernel version MUST be a semantic-version triplet (x.y.z)"
+[[ "$PATCH_NAME" =~ ^[a-z0-9-]+(-[a-z0-9]+)*$ ]] || die "Patch name MUST consist of only a-z, 0-9, and dashes"
+
+KERNEL_SRC="$BUILD_DIR/$KERNEL_FLAVOR"
+
+test -d "$KERNEL_SRC" || die "Kernel source checkout $KERNEL_SRC not found - have you run 'init-repos' yet?"
+cd $KERNEL_SRC
+
+TAG_PATTERN="${DISTRO_NAME}"
+[[ "$KERNEL_FLAVOR" != "generic" ]] && TAG_PATTERN+="-${KERNEL_FLAVOR}"
+TAG_PATTERN+="-${KVER}-${KERNEL_REV}.*"
+
+KERNEL_TAG="$(git tag --list "$TAG_PATTERN" | tail -1)"
+
+[[ -z "$KERNEL_TAG" ]] && die "No matching tags found like: $TAG_PATTERN"
+
+cat <<EOF
+KERNEL VERSION:       ${KVER}-${KERNEL_REV}-${KERNEL_FLAVOR}
+KERNEL TAG:           $KERNEL_TAG
+PATCH MODULE NAME:    $PATCH_NAME
+
+EOF
+
+if [[ "$(git describe)" == "$KERNEL_TAG" ]]; then
+    info "Kernel sources already checked out at $KERNEL_TAG; skipping checkout."
+else
+    info "Checking out kernel sources."
+    git reset --hard
+    git clean -xfd
+    git checkout $KERNEL_TAG
+fi
+
+info "Generating base kernel config (.config)"
+./debian/scripts/misc/annotations --export --arch "$ARCH" --flavour "$KERNEL_FLAVOR" > .config
+
+(
+    IFS="."; \
+    read VERSION PATCHLEVEL SUBLEVEL <<< "$KVER"; \
+    info "Setting version in Makefile to VERSION = $VERSION, PATCHLEVEL = $PATCHLEVEL, SUBLEVEL = $SUBLEVEL";
+    for v in VERSION PATCHLEVEL SUBLEVEL; do \
+        sed -re "/^$v = / c $v = ${!v}" -i Makefile;
+    done; \
+)
+
+LOCALVERSION="-${KERNEL_REV}-${KERNEL_FLAVOR}"
+info "Setting localversion to $LOCALVERSION"
+
+echo "$LOCALVERSION" > localversion
+
+info "Setting config overrides."
+scripts/config --set-str CONFIG_SYSTEM_TRUSTED_KEYS ""
+scripts/config --set-str CONFIG_SYSTEM_REVOCATION_KEYS ""
+scripts/config -e CONFIG_RUST
+
+info "Checking patches."
+PATCHES=($(list-patches))
+PATCH_FILES=()
+for p in "${PATCHES[@]}"; do
+    for PATCH_FILE in "$PATCH_DIR/${p}_${KVER}.patch" "$PATCH_DIR/$p.patch" ""; do
+        test -r "$PATCH_FILE" && break
+    done
+    test -n "$PATCH_FILE" || die "No .patch found for $p"
+
+    info "  => Patch file: $PATCH_FILE"
+
+    if ! patch --batch -Np1 --dry-run --reject-file=- --no-backup-if-mismatch < "$PATCH_FILE"; then
+        die "Patch $p failed to apply"
+    fi
+
+    PATCH_FILES+=("$PATCH_FILE")
+done
+
+info "Building kernel"
+kmake olddefconfig vmlinux modules_prepare
+
+cp -v vmlinux.symvers Module.symvers
+
+info "Building livepatch module"
+info "  Run 'tail -f $HOME/.kpatch/build.log' to follow build progress"
+KMOD_TARGET="$OUTPUT_DIR/${KVER}-${KERNEL_REV}-${KERNEL_FLAVOR}"
+test -d "$KMOD_TARGET" || mkdir -p "$KMOD_TARGET"
+cd "$KMOD_TARGET"
+
+/usr/local/bin/kpatch-build \
+    -s "$KERNEL_SRC" \
+    -c "$KERNEL_SRC/.config" \
+    -v "$KERNEL_SRC/vmlinux" \
+    -t "vmlinux" \
+    -n "$PATCH_NAME" \
+    "${PATCH_FILES[@]}"
+
+info "Wrote livepatch module to $(readlink -f "${PATCH_NAME}.ko")"
+
+modinfo "${PATCH_NAME}.ko"

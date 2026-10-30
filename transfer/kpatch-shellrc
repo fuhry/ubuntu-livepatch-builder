@@ -1,0 +1,142 @@
+#!/bin/false
+# vim:set ft=sh:
+
+BUILD_DIR=/build
+PATCH_DIR=$BUILD_DIR/patches
+OUTPUT_DIR=$BUILD_DIR/kmods
+DISTRO_NAME="$(lsb_release -si)"
+KVER="${KVER:-6.8.0}"
+PATCH_NAME="${PATCH_NAME:-}"
+ARCH="amd64"
+
+list-patches() {
+    shopt -s nullglob
+    local patches=($PATCH_DIR/*.patch)
+    shopt -u nullglob
+
+    for patch in ${patches[@]}; do
+        patch="$(basename "$patch")"
+        patch="${patch%.patch}"
+        [[ $patch =~ _[0-9]+(\.[0-9]+){2}$ ]] && continue
+        echo $patch
+    done
+}
+
+if [[ $- =~ i ]]; then
+	# interactive
+	echo -e "\e[34;1mUbuntu kernel live patch (kpatch) build environment\e[0m" >&2
+	cat <<EOF >&2
+
+CURRENT UBUNTU RELEASE: $(lsb_release -sc)
+                        (for best results, build on the target release
+                        so that compiler versions match)
+WORKING DIRECTORY:      $BUILD_DIR
+PATCH DIRECTORY:        $PATCH_DIR
+OUTPUT DIRECTORY:       $OUTPUT_DIR
+KERNEL VERSION:         $KVER
+                        (override with "kver x.y.z")
+PATCH NAME:             $PATCH_NAME
+                        (override with "pname any-name-you-want")
+
+COMMANDS:
+
+  init-repos
+      Extract and update pre-seeded kernel repositories
+
+  build-patch <KERNEL REVISION> <KERNEL FLAVOR>
+      Build a kernel patch loadable module. "KERNEL REVISION" is the
+      number directly after the version triplet, and "KERNEL FLAVOR"
+      is the variant of the kernel in use, i.e., if the full kernel
+      release is "6.8.0-147-generic", "147" is the revision, and
+      "generic" is the flavor. The latter defaults to "generic".
+
+
+EOF
+
+	if [[ -z "${PATCH_NAME:-}" ]]; then
+		PATCHES=($(list-patches))
+		DEFAULT_PATCH_NAME="${PATCHES[0]:-}"
+
+		read -p "Patch name? [$DEFAULT_PATCH_NAME]: " PATCH_NAME
+		[[ -z "$PATCH_NAME" ]] && PATCH_NAME="$DEFAULT_PATCH_NAME"
+	fi
+fi
+
+# non-interactive
+if [[ -z "$PATCH_NAME" ]]; then
+	echo "Set patch name 'pname NAME' before using 'build-patch'." >&2
+	# exit unless we're in an interactive shell
+	[[ $_ =~ i ]] || return 1
+fi
+
+export PATCH_NAME
+
+kver() {
+    if [[ "${1:-}" == "" ]]; then
+        echo $KVER
+        return 0
+    fi
+
+    KVER="$1"
+    export KVER
+}
+
+pname() {
+    if [[ "${1:-}" == "" ]]; then
+        echo $PATCH_NAME
+        return 0
+    fi
+
+    PATCH_NAME="$1"
+    export PATCH_NAME
+}
+
+ckver() {
+    local k="$KVER"
+    local n="$1"; shift
+    local flavor="${1:-$(basename $(pwd))}"; shift
+
+    echo "$k-$n-$flavor"
+
+    [[ "$flavor" == "generic" ]] && srcd="v$n" || srcd="${flavor}${n}"
+    [[ "$flavor" == "generic" ]] && tag="$(git tag -l "Ubuntu-$k-$n.*")" || tag="$(git tag -l "Ubuntu-$flavor-$k-$n.*" | tail -1)"
+    [[ "$tag" == "" ]] && { echo "bad tag, no matches for Ubuntu-$flavor-$k-$n.*"; return 1; }
+
+    test -d "/root/src/$srcd" || { echo "can't find srcdir /root/src/$srcd, extract linux-modules-$k-$n-${flavor}_${tag#Ubuntu-$flavor-}_amd64.deb there before continuing" >&2; return 1; }
+
+    git reset --hard
+    git checkout "$tag"
+
+    echo "-$n-$flavor" > localversion
+
+    cp -v /root/src/$srcd/boot/config-$k-$n-$flavor .config
+    prepconfig
+}
+
+prepconfig() {
+    sed -re '/^SUBLEVEL =/ c SUBLEVEL = 0' -i Makefile
+    scripts/config --set-str CONFIG_SYSTEM_TRUSTED_KEYS ""
+    scripts/config --set-str CONFIG_SYSTEM_REVOCATION_KEYS ""
+    scripts/config -e CONFIG_RUST
+}
+
+kpb() {
+    local flavor="${1:-generic}"
+    pf="../${PATCH}_${KVER}.patch"
+    test -f "$pf" || pf="../${PATCH}.patch"
+    if ! test -f "$pf" ; then
+        echo "patch not found: $pf" >&2
+        return 1
+    fi
+    env PATH=/root/tmp/lp-22/bin:$PATH kpatch-build -s ../../$flavor -c ../../$flavor/.config -v ../../$flavor/vmlinux -t vmlinux -n "${PATCH}" "$pf"
+}
+
+kmake() {
+    make -j$(nproc) \
+        CC='/usr/local/libexec/kpatch/kpatch-cc gcc' \
+        LD='/usr/local/libexec/kpatch/kpatch-cc ld' \
+        BINDGEN='bindgen-0.65' \
+        "$@"
+}
+
+alias init-repos="/build/init-repos"

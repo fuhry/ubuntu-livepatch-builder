@@ -1,0 +1,26 @@
+#!/bin/bash
+
+set -euo pipefail
+cd "$(dirname "$0")"
+
+for repo in aws generic; do
+    test -d $repo/.git && continue
+
+    echo "Setting up repo: $repo" >&2
+
+    mkdir -p $repo/.git
+    cd $repo/.git
+
+    echo "  - Extracting $(readlink -f ../../repo-seed/$repo.tar) into $(readlink -f .)"
+    tar -x -f ../../repo-seed/$repo.tar
+
+    sed -re 's;bare = true;bare = false;' -i config
+
+    echo "  - Checking out master"
+    cd .. && git checkout master
+
+    echo "  - Fetching latest tags"
+    git fetch $(lsb_release -sc) --tags
+
+    cd ..
+done
